@@ -62,10 +62,13 @@ class Completer:
             "set_profile", "set_agent", "discover_ollama", "install_tools",
             "scan", "quick_scan", "recon", "full_recon", "check_tools",
             "experience", "wizard", "analyze", "agent", "ai_agent",
-            # New autonomous agent modes
+            # Autonomous agent modes
             "pentest", "full_auto", "recon_only", "prompt_only", "analyze_only",
             # Task library
             "tasks", "task", "list_tasks", "create_task", "run_task",
+            # Flags (for inline completion)
+            "--kali", "--vpn", "--vpn-user", "--vpn-pass",
+            "--researcher", "--multi-agent", "--custom-prompts",
             "exit", "quit"
         ]
         self.agent_roles = list(self.neurosploit.config.get('agent_roles', {}).keys())
@@ -663,6 +666,43 @@ class NeuroSploitv2:
             margin-top: 3rem;
         }}
 
+        /* OHVR Structure */
+        .ohvr-section {{
+            margin: 1rem 0;
+            padding: 1rem;
+            background: rgba(0,0,0,0.2);
+            border-radius: 8px;
+        }}
+        .ohvr-section h5 {{
+            color: var(--accent);
+            margin-bottom: 0.5rem;
+            text-transform: uppercase;
+            font-size: 0.8rem;
+            letter-spacing: 1px;
+        }}
+        .screenshot-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 1rem;
+            margin: 1rem 0;
+        }}
+        .screenshot-card {{
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            overflow: hidden;
+        }}
+        .screenshot-card img {{
+            width: 100%;
+            height: auto;
+            display: block;
+        }}
+        .screenshot-caption {{
+            padding: 0.5rem;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            text-align: center;
+        }}
+
         /* Print Styles */
         @media print {{
             body {{ background: white; color: black; }}
@@ -1080,7 +1120,16 @@ CONTEXTO DE RECON:
         prompt: Optional[str] = None,
         prompt_file: Optional[str] = None,
         context_file: Optional[str] = None,
-        llm_profile: Optional[str] = None
+        llm_profile: Optional[str] = None,
+        enable_kali_sandbox: bool = False,
+        vpn_file: Optional[str] = None,
+        vpn_user: Optional[str] = None,
+        vpn_pass: Optional[str] = None,
+        enable_researcher: bool = False,
+        enable_multi_agent: bool = False,
+        scan_id: Optional[str] = None,
+        custom_prompts: bool = False,
+        generate_report: bool = True,
     ) -> Dict:
         """
         Run the Autonomous AI Security Agent.
@@ -1099,22 +1148,73 @@ CONTEXTO DE RECON:
             prompt_file: Path to .md prompt file
             context_file: Path to recon context JSON
             llm_profile: LLM profile to use
+            enable_kali_sandbox: Use Kali Docker container
+            vpn_file: Path to .ovpn file (requires enable_kali_sandbox)
+            vpn_user: VPN username
+            vpn_pass: VPN password
+            enable_researcher: Enable AI Researcher agent
+            enable_multi_agent: Enable multi-agent orchestration
+            scan_id: Custom scan ID for tracking
+            custom_prompts: Load custom prompts from data/custom_prompts/
+            generate_report: Generate HTML report (default True)
         """
         if not AutonomousAgent:
             print("[!] Autonomous Agent not available. Check installation.")
             return {"error": "Agent not installed"}
+
+        # Generate scan_id
+        scan_id = scan_id or f"cli_{self.session_id}"
 
         print(f"\n{'='*70}")
         print("   NEUROSPLOIT AUTONOMOUS AI AGENT")
         print(f"{'='*70}")
         print(f"\n[*] Target: {target}")
         print(f"[*] Mode: {mode.upper()}")
+        print(f"[*] Scan ID: {scan_id}")
+        if enable_kali_sandbox:
+            print(f"[*] Kali Sandbox: ENABLED")
+        if vpn_file:
+            print(f"[*] VPN: {vpn_file}")
+        if enable_researcher:
+            print(f"[*] AI Researcher: ENABLED")
+        if enable_multi_agent:
+            print(f"[*] Multi-Agent: ENABLED")
 
         # Warning for prompt_only mode
         if mode == "prompt_only":
             print("\n[!] WARNING: PROMPT-ONLY MODE")
             print("[!] This mode uses significantly more tokens than other modes.")
             print("[!] The AI will decide what tools to use based on your prompt.\n")
+
+        # VPN requires Kali sandbox
+        if vpn_file and not enable_kali_sandbox:
+            print("[!] --vpn requires --kali flag. Enabling Kali sandbox automatically.")
+            enable_kali_sandbox = True
+
+        # Set env vars for sub-modules
+        if enable_researcher:
+            os.environ["ENABLE_RESEARCHER_AI"] = "true"
+        if enable_multi_agent:
+            os.environ["ENABLE_MULTI_AGENT"] = "true"
+
+        # Load custom prompts from data/custom_prompts/
+        loaded_custom_prompts = []
+        if custom_prompts:
+            prompts_dir = Path("data/custom_prompts")
+            if prompts_dir.exists():
+                for pf in sorted(prompts_dir.glob("*.json")):
+                    try:
+                        with open(pf) as f:
+                            data = json.load(f)
+                        if isinstance(data, list):
+                            loaded_custom_prompts.extend(data)
+                        elif isinstance(data, dict):
+                            loaded_custom_prompts.append(data)
+                        print(f"[+] Loaded custom prompt: {pf.name}")
+                    except Exception as e:
+                        print(f"[!] Error loading {pf.name}: {e}")
+            else:
+                print(f"[!] Custom prompts directory not found: {prompts_dir}")
 
         # Load task from library
         task = None
@@ -1156,10 +1256,6 @@ CONTEXTO DE RECON:
         }
         op_mode = mode_map.get(mode, OperationMode.FULL_AUTO)
 
-        # Initialize LLM
-        profile = llm_profile or self.config.get('llm', {}).get('default_profile')
-        self._initialize_llm_manager(profile)
-
         print(f"[*] Session: {self.session_id}\n")
 
         # Run agent
@@ -1171,23 +1267,50 @@ CONTEXTO DE RECON:
                 print(f"{prefix} {message}")
 
             async def progress_cb(progress: int, message: str):
-                bar = "=" * (progress // 5) + ">" + " " * (20 - progress // 5)
-                print(f"\r[{bar}] {progress}% - {message}", end="", flush=True)
+                filled = int(progress / 5)
+                bar = "\u2588" * filled + "\u2591" * (20 - filled)
+                phase = "RECON" if progress < 25 else "TEST" if progress < 50 else "DEEP" if progress < 75 else "REPORT"
+                print(f"\r  [{bar}] {progress:3d}% [{phase:6s}] {message[:55]}", end="", flush=True)
                 if progress == 100:
                     print()
+
+            async def finding_cb(finding: dict):
+                sev = finding.get('severity', 'info').upper()
+                icons = {"CRITICAL": "\U0001f534", "HIGH": "\U0001f7e0", "MEDIUM": "\U0001f7e1", "LOW": "\U0001f7e2", "INFO": "\U0001f535"}
+                icon = icons.get(sev, "\u26aa")
+                confidence = finding.get('confidence_score', 0)
+                title = finding.get('title', 'Unknown')[:60]
+                endpoint = finding.get('endpoint', '')[:50]
+                print(f"\n  {icon} [{sev}] {title}")
+                print(f"     Endpoint: {endpoint}")
+                print(f"     Confidence: {confidence}/100")
 
             async with AutonomousAgent(
                 target=target,
                 mode=op_mode,
-                llm_manager=self.llm_manager_instance,
                 log_callback=log_cb,
                 progress_callback=progress_cb,
+                finding_callback=finding_cb,
                 task=task,
                 custom_prompt=prompt,
                 recon_context=recon_context,
-                config=self.config,
-                prompt_file=prompt_file
+                scan_id=scan_id,
+                enable_kali_sandbox=enable_kali_sandbox,
+                loaded_custom_prompts=loaded_custom_prompts if loaded_custom_prompts else None,
             ) as agent:
+                # Connect VPN inside sandbox if requested
+                if vpn_file and enable_kali_sandbox:
+                    sandbox = getattr(agent, '_sandbox', None)
+                    if sandbox and hasattr(sandbox, 'connect_vpn'):
+                        try:
+                            vpn_data = Path(vpn_file).read_bytes()
+                            success, msg = await sandbox.connect_vpn(vpn_data, vpn_user, vpn_pass)
+                            await log_cb("info" if success else "error", f"VPN: {msg}")
+                        except Exception as e:
+                            await log_cb("error", f"VPN connection failed: {e}")
+                    else:
+                        await log_cb("warning", "VPN requested but sandbox not available")
+
                 return await agent.run()
 
         try:
@@ -1199,14 +1322,32 @@ CONTEXTO DE RECON:
             return {"error": str(e)}
 
         # Save results
-        result_file = f"results/autonomous_{self.session_id}.json"
+        result_file = f"results/autonomous_{scan_id}.json"
         with open(result_file, 'w') as f:
             json.dump(report, f, indent=2, default=str)
         print(f"\n[+] Results saved: {result_file}")
 
         # Generate HTML report
-        if report.get("findings"):
+        if generate_report and report.get("findings"):
             self._generate_autonomous_report(report)
+
+        # Print summary
+        findings = report.get("findings", [])
+        if findings:
+            print(f"\n{'='*70}")
+            print(f"  FINDINGS SUMMARY ({len(findings)} total)")
+            print(f"{'='*70}")
+            severity_counts = {}
+            for f in findings:
+                s = f.get("severity", "info").upper()
+                severity_counts[s] = severity_counts.get(s, 0) + 1
+            for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]:
+                count = severity_counts.get(sev, 0)
+                if count:
+                    print(f"  {sev:10s}: {count}")
+            avg_confidence = sum(f.get("confidence_score", 0) for f in findings) / len(findings)
+            print(f"  {'AVG CONF':10s}: {avg_confidence:.0f}/100")
+            print(f"{'='*70}\n")
 
         return report
 
@@ -1299,6 +1440,12 @@ CONTEXTO DE RECON:
             if finding.get("cwe_id"):
                 vuln["cwe_id"] = finding["cwe_id"]
 
+            # Add confidence data
+            if finding.get("confidence_score") is not None:
+                vuln["confidence_score"] = finding["confidence_score"]
+                vuln["confidence_breakdown"] = finding.get("confidence_breakdown", {})
+                vuln["proof_of_execution"] = finding.get("proof_of_execution", "")
+
             scan_data["vulnerabilities"].append(vuln)
 
         # Generate LLM analysis summary
@@ -1335,12 +1482,18 @@ Risk Level: **{summary.get('risk_level', 'UNKNOWN')}**
             if finding.get("cvss"):
                 cvss_info = f"**CVSS:** {finding['cvss'].get('score', 'N/A')} ({finding['cvss'].get('vector', '')})"
 
+            confidence = finding.get('confidence_score', 0)
+            conf_label = "Confirmed" if confidence >= 90 else "Likely" if confidence >= 60 else "Uncertain"
+            proof = finding.get('proof_of_execution', '')
+
             llm_analysis += f"""
 ---
 #### {i}. {finding.get('title', 'Unknown')} [{finding.get('severity', 'medium').upper()}]
 {cvss_info}
 **CWE:** {finding.get('cwe_id', 'N/A')}
 **Endpoint:** `{finding.get('endpoint', 'N/A')}`
+**Confidence:** {confidence}/100 ({conf_label})
+{f'**Proof:** {proof}' if proof else ''}
 
 **Description:**
 {finding.get('description', 'No description')}
@@ -1666,6 +1819,12 @@ Risk Level: **{summary.get('risk_level', 'UNKNOWN')}**
                         task_id = None
                         prompt_file = None
                         context_file = None
+                        enable_kali = False
+                        vpn_file = None
+                        vpn_user = None
+                        vpn_pass = None
+                        enable_researcher = False
+                        enable_multi_agent = False
 
                         i = 2
                         while i < len(parts):
@@ -1678,23 +1837,57 @@ Risk Level: **{summary.get('risk_level', 'UNKNOWN')}**
                             elif parts[i] in ['--context', '-c'] and i + 1 < len(parts):
                                 context_file = parts[i + 1].strip().strip('"')
                                 i += 2
+                            elif parts[i] == '--kali':
+                                enable_kali = True
+                                i += 1
+                            elif parts[i] == '--vpn' and i + 1 < len(parts):
+                                vpn_file = parts[i + 1].strip().strip('"')
+                                i += 2
+                            elif parts[i] == '--vpn-user' and i + 1 < len(parts):
+                                vpn_user = parts[i + 1].strip()
+                                i += 2
+                            elif parts[i] == '--vpn-pass' and i + 1 < len(parts):
+                                vpn_pass = parts[i + 1].strip()
+                                i += 2
+                            elif parts[i] == '--researcher':
+                                enable_researcher = True
+                                i += 1
+                            elif parts[i] == '--multi-agent':
+                                enable_multi_agent = True
+                                i += 1
                             else:
                                 i += 1
 
-                        self.run_autonomous_agent(target, "full_auto", task_id, None, prompt_file, context_file)
+                        self.run_autonomous_agent(
+                            target, "full_auto", task_id, None, prompt_file, context_file,
+                            enable_kali_sandbox=enable_kali, vpn_file=vpn_file,
+                            vpn_user=vpn_user, vpn_pass=vpn_pass,
+                            enable_researcher=enable_researcher,
+                            enable_multi_agent=enable_multi_agent,
+                        )
                     else:
-                        print("Usage: pentest <target> [--task <task_id>] [--prompt <file.md>] [--context <file.json>]")
+                        print("Usage: pentest <target> [options]")
                         print("")
-                        print("Full autonomous pentest: Recon -> Analyze -> Test -> Report")
+                        print("Options:")
+                        print("  --task <id>          Use preset task from library")
+                        print("  --prompt <file.md>   Custom prompt file")
+                        print("  --context <file.json> Recon context file")
+                        print("  --kali               Enable Kali sandbox")
+                        print("  --vpn <file.ovpn>    VPN config (requires --kali)")
+                        print("  --vpn-user <user>    VPN username")
+                        print("  --vpn-pass <pass>    VPN password")
+                        print("  --researcher         Enable AI Researcher")
+                        print("  --multi-agent        Enable multi-agent mode")
 
                 elif cmd.startswith('recon_only '):
                     # Recon-only mode
                     parts = cmd.split()
                     if len(parts) >= 2:
                         target = parts[1].strip().strip('"')
-                        self.run_autonomous_agent(target, "recon_only")
+                        enable_kali = '--kali' in parts
+                        self.run_autonomous_agent(target, "recon_only", enable_kali_sandbox=enable_kali)
                     else:
-                        print("Usage: recon_only <target>")
+                        print("Usage: recon_only <target> [--kali]")
                         print("Just reconnaissance, no vulnerability testing")
 
                 elif cmd.startswith('prompt_only '):
@@ -1704,12 +1897,16 @@ Risk Level: **{summary.get('risk_level', 'UNKNOWN')}**
                         target = parts[1].strip().strip('"')
                         prompt = None
                         prompt_file = None
+                        enable_kali = '--kali' in parts
+                        enable_researcher = '--researcher' in parts
 
                         i = 2
                         while i < len(parts):
                             if parts[i] in ['--prompt', '-p'] and i + 1 < len(parts):
                                 prompt_file = parts[i + 1].strip().strip('"')
                                 i += 2
+                            elif parts[i] in ['--kali', '--researcher']:
+                                i += 1
                             else:
                                 i += 1
 
@@ -1724,7 +1921,10 @@ Risk Level: **{summary.get('risk_level', 'UNKNOWN')}**
                             prompt = "\n".join(lines)
 
                         print("\n[!] WARNING: PROMPT-ONLY MODE uses more tokens!")
-                        self.run_autonomous_agent(target, "prompt_only", None, prompt, prompt_file)
+                        self.run_autonomous_agent(
+                            target, "prompt_only", None, prompt, prompt_file,
+                            enable_kali_sandbox=enable_kali, enable_researcher=enable_researcher,
+                        )
                     else:
                         print("Usage: prompt_only <target> [--prompt <file.md>]")
                         print("")
@@ -1746,9 +1946,12 @@ Risk Level: **{summary.get('risk_level', 'UNKNOWN')}**
                             else:
                                 i += 1
 
-                        self.run_autonomous_agent(target, "analyze_only", None, None, None, context_file)
+                        self.run_autonomous_agent(
+                            target, "analyze_only", None, None, None, context_file,
+                            custom_prompts='--custom-prompts' in parts,
+                        )
                     else:
-                        print("Usage: analyze_only <target> [--context <file.json>]")
+                        print("Usage: analyze_only <target> [--context <file.json>] [--custom-prompts]")
                         print("Analysis only, no active testing")
 
                 # === TASK LIBRARY COMMANDS ===
@@ -1895,12 +2098,26 @@ TOOL MANAGEMENT:
 AUTONOMOUS AI AGENT (Like PentAGI):
   pentest <url>              - Full auto: Recon -> Analyze -> Test -> Report
   pentest <url> --task <id>  - Use preset task from library
-  recon_only <url>           - Just reconnaissance, no testing
+  pentest <url> --kali       - Use Kali Docker sandbox
+  pentest <url> --kali --vpn <file.ovpn> --vpn-user <u> --vpn-pass <p>
+                             - Full pentest through VPN
+  pentest <url> --researcher - Enable AI Researcher (0-day hunting)
+  pentest <url> --multi-agent - Enable multi-agent orchestration
+  recon_only <url> [--kali]  - Just reconnaissance, no testing
   prompt_only <url>          - AI decides everything (HIGH TOKEN USAGE!)
   analyze_only <url> -c <f>  - Analysis only, no active testing
 
+  Agent flags (combine with any mode above):
+    --kali               Enable Kali sandbox (Docker per scan)
+    --vpn <file.ovpn>    VPN config (requires --kali)
+    --vpn-user <user>    VPN username
+    --vpn-pass <pass>    VPN password
+    --researcher         AI Researcher (hypothesis-driven 0-day)
+    --multi-agent        Multi-agent orchestration (5 specialists)
+
   The autonomous agent generates:
     - CVSS scores with vector strings
+    - Confidence scores (0-100) with proof of execution
     - Detailed descriptions and impact analysis
     - Working PoC code
     - Remediation recommendations
@@ -1942,6 +2159,11 @@ EXAMPLES:
   analyze results/context_X.json     - LLM analysis of context file
   scan https://example.com           - Full pentest scan
   quick_scan 192.168.1.1             - Quick vulnerability check
+  pentest https://target.com --kali  - Full pentest in Kali sandbox
+  pentest https://target.com --kali --vpn client.ovpn --vpn-user admin --vpn-pass s3cret
+                                     - Full pentest through VPN
+  pentest https://target.com --researcher --kali
+                                     - AI Researcher with Kali sandbox
   agent https://target.com           - AI Agent pentest (uses LLM)
   agent https://target.com -p bug_bounty.md -c context.json
 =======================================================================
@@ -2020,6 +2242,28 @@ EXAMPLES:
                        help='Custom .md prompt file for AI agent')
     parser.add_argument('--list-tasks', action='store_true',
                        help='List all available tasks from library')
+
+    # Kali Sandbox + VPN options
+    parser.add_argument('--kali', action='store_true',
+                       help='Enable Kali sandbox (Docker container per scan)')
+    parser.add_argument('--vpn', metavar='FILE',
+                       help='Path to .ovpn file for VPN inside Kali sandbox (requires --kali)')
+    parser.add_argument('--vpn-user', metavar='USER',
+                       help='VPN username (used with --vpn)')
+    parser.add_argument('--vpn-pass', metavar='PASS',
+                       help='VPN password (used with --vpn)')
+
+    # Advanced agent options
+    parser.add_argument('--researcher', action='store_true',
+                       help='Enable AI Researcher (hypothesis-driven 0-day hunting)')
+    parser.add_argument('--multi-agent', action='store_true',
+                       help='Enable multi-agent orchestration (5 specialist agents)')
+    parser.add_argument('--scan-id', metavar='ID',
+                       help='Custom scan ID (for tracking)')
+    parser.add_argument('--custom-prompts', action='store_true',
+                       help='Load custom prompts from data/custom_prompts/')
+    parser.add_argument('--no-report', action='store_true',
+                       help='Skip HTML report generation')
 
     # Legacy AI Agent options
     parser.add_argument('--agent', metavar='TARGET',
@@ -2102,7 +2346,16 @@ EXAMPLES:
             task_id=args.task,
             prompt_file=args.prompt_file,
             context_file=args.context_file,
-            llm_profile=args.llm_profile
+            llm_profile=args.llm_profile,
+            enable_kali_sandbox=args.kali,
+            vpn_file=args.vpn,
+            vpn_user=args.vpn_user,
+            vpn_pass=args.vpn_pass,
+            enable_researcher=args.researcher,
+            enable_multi_agent=args.multi_agent,
+            scan_id=args.scan_id,
+            custom_prompts=args.custom_prompts,
+            generate_report=not args.no_report,
         )
 
     # Handle Recon Only
@@ -2110,7 +2363,13 @@ EXAMPLES:
         framework.run_autonomous_agent(
             target=args.recon_only,
             mode="recon_only",
-            llm_profile=args.llm_profile
+            llm_profile=args.llm_profile,
+            enable_kali_sandbox=args.kali,
+            vpn_file=args.vpn,
+            vpn_user=args.vpn_user,
+            vpn_pass=args.vpn_pass,
+            scan_id=args.scan_id,
+            generate_report=not args.no_report,
         )
 
     # Handle Prompt Only (High Token Usage Warning)
@@ -2125,7 +2384,16 @@ EXAMPLES:
             mode="prompt_only",
             prompt_file=args.prompt_file,
             context_file=args.context_file,
-            llm_profile=args.llm_profile
+            llm_profile=args.llm_profile,
+            enable_kali_sandbox=args.kali,
+            vpn_file=args.vpn,
+            vpn_user=args.vpn_user,
+            vpn_pass=args.vpn_pass,
+            enable_researcher=args.researcher,
+            enable_multi_agent=args.multi_agent,
+            scan_id=args.scan_id,
+            custom_prompts=args.custom_prompts,
+            generate_report=not args.no_report,
         )
 
     # Handle Analyze Only
@@ -2134,7 +2402,10 @@ EXAMPLES:
             target=args.analyze_only,
             mode="analyze_only",
             context_file=args.context_file,
-            llm_profile=args.llm_profile
+            llm_profile=args.llm_profile,
+            scan_id=args.scan_id,
+            custom_prompts=args.custom_prompts,
+            generate_report=not args.no_report,
         )
 
     # Handle List Tasks

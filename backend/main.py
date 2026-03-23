@@ -11,7 +11,7 @@ from pathlib import Path
 
 from backend.config import settings
 from backend.db.database import init_db, close_db
-from backend.api.v1 import scans, targets, prompts, reports, dashboard, vulnerabilities, settings as settings_router, agent, agent_tasks
+from backend.api.v1 import scans, targets, prompts, reports, dashboard, vulnerabilities, settings as settings_router, agent, agent_tasks, scheduler, vuln_lab, terminal, sandbox, knowledge, mcp, providers, full_ia, cli_agent
 from backend.api.websocket import manager as ws_manager
 
 
@@ -23,9 +23,58 @@ async def lifespan(app: FastAPI):
     await init_db()
     print("Database initialized")
 
+    # Initialize scheduler
+    try:
+        import json
+        config_path = Path(__file__).parent.parent / "config" / "config.json"
+        if config_path.exists():
+            with open(config_path) as f:
+                config = json.load(f)
+            from core.scheduler import ScanScheduler
+            scan_scheduler = ScanScheduler(config)
+            scan_scheduler.start()
+            app.state.scheduler = scan_scheduler
+            print(f"Scheduler initialized (enabled={scan_scheduler.enabled})")
+        else:
+            app.state.scheduler = None
+    except Exception as e:
+        print(f"Scheduler init skipped: {e}")
+        app.state.scheduler = None
+
+    # Cleanup orphan sandbox containers from previous crashes
+    try:
+        from core.container_pool import get_pool
+        pool = get_pool()
+        await pool.cleanup_orphans()
+        print("Sandbox pool initialized (orphan cleanup done)")
+    except Exception as e:
+        print(f"Sandbox pool init skipped: {e}")
+
+    # Initialize Smart Router (provider management + OAuth)
+    try:
+        from backend.core.smart_router import init_router
+        await init_router()
+    except Exception as e:
+        print(f"Smart Router init skipped: {e}")
+
     yield
 
     # Shutdown
+    # Stop Smart Router token refresher
+    try:
+        from backend.core.smart_router import shutdown_router
+        await shutdown_router()
+    except Exception:
+        pass
+    # Destroy all per-scan sandbox containers
+    try:
+        from core.container_pool import get_pool
+        await get_pool().cleanup_all()
+        print("Sandbox containers cleaned up")
+    except Exception:
+        pass
+    if hasattr(app.state, 'scheduler') and app.state.scheduler:
+        app.state.scheduler.stop()
     print("Shutting down...")
     await close_db()
 
@@ -60,6 +109,15 @@ app.include_router(vulnerabilities.router, prefix="/api/v1/vulnerabilities", tag
 app.include_router(settings_router.router, prefix="/api/v1/settings", tags=["Settings"])
 app.include_router(agent.router, prefix="/api/v1/agent", tags=["AI Agent"])
 app.include_router(agent_tasks.router, prefix="/api/v1/agent-tasks", tags=["Agent Tasks"])
+app.include_router(scheduler.router, prefix="/api/v1/scheduler", tags=["Scheduler"])
+app.include_router(vuln_lab.router, prefix="/api/v1/vuln-lab", tags=["Vulnerability Lab"])
+app.include_router(terminal.router, prefix="/api/v1/terminal", tags=["Terminal Agent"])
+app.include_router(sandbox.router, prefix="/api/v1/sandbox", tags=["Sandbox"])
+app.include_router(knowledge.router, prefix="/api/v1/knowledge", tags=["Knowledge"])
+app.include_router(mcp.router, prefix="/api/v1/mcp", tags=["MCP Servers"])
+app.include_router(providers.router, prefix="/api/v1/providers", tags=["Providers"])
+app.include_router(full_ia.router, prefix="/api/v1/full-ia", tags=["FULL AI Testing"])
+app.include_router(cli_agent.router)
 
 
 @app.get("/api/health")

@@ -207,3 +207,24 @@ export const useDashboardStore = create<DashboardState>((set) => ({
   setRecentVulnerabilities: (recentVulnerabilities) => set({ recentVulnerabilities }),
   setLoading: (isLoading) => set({ isLoading }),
 }))
+
+// ── UI Preferences Store (persisted to localStorage) ──
+
+interface UIState {
+  sidebarCollapsed: boolean
+  toggleSidebar: () => void
+  setSidebarCollapsed: (collapsed: boolean) => void
+}
+
+export const useUIStore = create<UIState>()(
+  persist(
+    (set) => ({
+      sidebarCollapsed: false,
+      toggleSidebar: () => set((state) => ({ sidebarCollapsed: !state.sidebarCollapsed })),
+      setSidebarCollapsed: (collapsed) => set({ sidebarCollapsed: collapsed }),
+    }),
+    {
+      name: 'neurosploit-ui-store',
+    }
+  )
+)

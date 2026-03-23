@@ -5,6 +5,7 @@ const pageTitles: Record<string, string> = {
   '/scan/new': 'New Security Scan',
   '/reports': 'Reports',
   '/settings': 'Settings',
+  '/full-ia': 'FULL AI TESTING',
 }
 
 export default function Header() {

@@ -32,11 +32,43 @@ class Settings(BaseSettings):
     # LLM Settings
     ANTHROPIC_API_KEY: Optional[str] = os.getenv("ANTHROPIC_API_KEY")
     OPENAI_API_KEY: Optional[str] = os.getenv("OPENAI_API_KEY")
+    OPENROUTER_API_KEY: Optional[str] = os.getenv("OPENROUTER_API_KEY")
+    GEMINI_API_KEY: Optional[str] = os.getenv("GEMINI_API_KEY")
+    AZURE_OPENAI_API_KEY: Optional[str] = os.getenv("AZURE_OPENAI_API_KEY")
+    AZURE_OPENAI_ENDPOINT: Optional[str] = os.getenv("AZURE_OPENAI_ENDPOINT")
+    AZURE_OPENAI_API_VERSION: str = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01")
+    AZURE_OPENAI_DEPLOYMENT: Optional[str] = os.getenv("AZURE_OPENAI_DEPLOYMENT")
+    TOGETHER_API_KEY: Optional[str] = os.getenv("TOGETHER_API_KEY")
+    FIREWORKS_API_KEY: Optional[str] = os.getenv("FIREWORKS_API_KEY")
     DEFAULT_LLM_PROVIDER: str = "claude"
     DEFAULT_LLM_MODEL: str = "claude-sonnet-4-20250514"
+    MAX_OUTPUT_TOKENS: Optional[int] = None
+    ENABLE_MODEL_ROUTING: bool = False
+
+    # Feature Flags
+    ENABLE_KNOWLEDGE_AUGMENTATION: bool = False
+    ENABLE_BROWSER_VALIDATION: bool = False
+    ENABLE_VULN_AGENTS: bool = False
+    VULN_AGENT_CONCURRENCY: int = 10
+    ENABLE_SMART_ROUTER: bool = False
+
+    # RAG (Retrieval-Augmented Generation)
+    ENABLE_RAG: bool = True  # Enabled by default (zero deps, uses BM25)
+    RAG_BACKEND: str = "auto"  # "auto", "chromadb", "tfidf", "bm25"
+
+    # External Methodology File (injected into all LLM calls)
+    METHODOLOGY_FILE: Optional[str] = None  # Path to .md methodology file
+
+    # CLI Agent (AI CLI tools inside Kali sandbox)
+    ENABLE_CLI_AGENT: bool = False  # Feature flag (default: disabled)
+    CLI_AGENT_MAX_RUNTIME: int = 1800  # Max runtime in seconds (default: 30 min)
+    CLI_AGENT_DEFAULT_PROVIDER: str = "claude_code"  # Default CLI provider
+
+    # Codex LLM
+    CODEX_API_KEY: Optional[str] = os.getenv("CODEX_API_KEY")
 
     # Scan Settings
-    MAX_CONCURRENT_SCANS: int = 3
+    MAX_CONCURRENT_SCANS: int = 5
     DEFAULT_TIMEOUT: int = 30
     MAX_REQUESTS_PER_SECOND: int = 10
 
@@ -46,6 +78,7 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         case_sensitive = True
+        extra = "ignore"
 
 
 settings = Settings()

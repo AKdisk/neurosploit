@@ -14,6 +14,8 @@ class ReportGenerate(BaseModel):
     include_executive_summary: bool = Field(True, description="Include executive summary")
     include_poc: bool = Field(True, description="Include proof of concept")
     include_remediation: bool = Field(True, description="Include remediation steps")
+    preferred_provider: Optional[str] = Field(None, description="Preferred LLM provider for AI report generation")
+    preferred_model: Optional[str] = Field(None, description="Preferred model for AI report generation")
 
 
 class ReportResponse(BaseModel):

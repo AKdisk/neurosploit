@@ -6,6 +6,12 @@ from fastapi import WebSocket
 import json
 import asyncio
 
+try:
+    from backend.core.notification_manager import notification_manager, NotificationEvent
+    HAS_NOTIFICATIONS = True
+except ImportError:
+    HAS_NOTIFICATIONS = False
+
 
 class ConnectionManager:
     """Manages WebSocket connections for real-time updates"""
@@ -49,12 +55,16 @@ class ConnectionManager:
         for conn in dead_connections:
             self.disconnect(conn, scan_id)
 
-    async def broadcast_scan_started(self, scan_id: str):
+    async def broadcast_scan_started(self, scan_id: str, target: str = ""):
         """Notify that a scan has started"""
         await self.send_to_scan(scan_id, {
             "type": "scan_started",
             "scan_id": scan_id
         })
+        if HAS_NOTIFICATIONS:
+            asyncio.create_task(notification_manager.notify(
+                NotificationEvent.SCAN_STARTED, {"target": target, "scan_id": scan_id}
+            ))
 
     async def broadcast_phase_change(self, scan_id: str, phase: str):
         """Notify phase change (recon, testing, reporting)"""
@@ -124,6 +134,16 @@ class ConnectionManager:
             "scan_id": scan_id,
             "vulnerability": vulnerability
         })
+        if HAS_NOTIFICATIONS:
+            asyncio.create_task(notification_manager.notify(
+                NotificationEvent.VULN_FOUND, {
+                    "title": vulnerability.get("title", "Vulnerability Found"),
+                    "severity": vulnerability.get("severity", "medium"),
+                    "vulnerability_type": vulnerability.get("vulnerability_type", "unknown"),
+                    "endpoint": vulnerability.get("endpoint", ""),
+                    "description": vulnerability.get("description", ""),
+                }
+            ))
 
     async def broadcast_log(self, scan_id: str, level: str, message: str):
         """Send a log message"""
@@ -141,6 +161,15 @@ class ConnectionManager:
             "scan_id": scan_id,
             "summary": summary
         })
+        if HAS_NOTIFICATIONS:
+            asyncio.create_task(notification_manager.notify(
+                NotificationEvent.SCAN_COMPLETED, {
+                    "total_vulnerabilities": summary.get("total_vulnerabilities", 0),
+                    "critical": summary.get("critical", 0),
+                    "high": summary.get("high", 0),
+                    "medium": summary.get("medium", 0),
+                }
+            ))
 
     async def broadcast_scan_stopped(self, scan_id: str, summary: dict):
         """Notify that a scan was stopped by user"""
@@ -160,6 +189,10 @@ class ConnectionManager:
             "error": error,
             "summary": summary or {}
         })
+        if HAS_NOTIFICATIONS:
+            asyncio.create_task(notification_manager.notify(
+                NotificationEvent.SCAN_FAILED, {"error": error}
+            ))
 
     async def broadcast_stats_update(self, scan_id: str, stats: dict):
         """Broadcast updated scan statistics"""

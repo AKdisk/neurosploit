@@ -32,6 +32,8 @@ agent_instances: Dict[str, AutonomousAgent] = {}
 
 # Map agent_id to scan_id for database persistence
 agent_to_scan: Dict[str, str] = {}
+# Reverse map: scan_id to agent_id for ScanDetailsPage lookups
+scan_to_agent: Dict[str, str] = {}
 
 
 @router.get("/status")
@@ -101,6 +103,9 @@ class AgentMode(str, Enum):
     RECON_ONLY = "recon_only"      # Just reconnaissance
     PROMPT_ONLY = "prompt_only"    # AI decides (high tokens)
     ANALYZE_ONLY = "analyze_only"  # Analysis without testing
+    AUTO_PENTEST = "auto_pentest"  # One-click full auto pentest
+    CLI_AGENT = "cli_agent"        # AI CLI tool inside Kali sandbox
+    FULL_LLM_PENTEST = "full_llm_pentest"  # LLM drives the entire pentest cycle
 
 
 class AgentRequest(BaseModel):
@@ -113,6 +118,16 @@ class AgentRequest(BaseModel):
     auth_value: Optional[str] = Field(None, description="Auth value (cookie string, token, etc)")
     custom_headers: Optional[Dict[str, str]] = Field(None, description="Custom HTTP headers")
     max_depth: int = Field(5, description="Maximum crawl depth")
+    subdomain_discovery: bool = Field(False, description="Enable subdomain discovery (auto_pentest mode)")
+    targets: Optional[List[str]] = Field(None, description="Multiple targets (auto_pentest mode)")
+    enable_kali_sandbox: bool = Field(False, description="Enable Kali Linux sandbox for tool execution + AI researcher")
+    custom_prompt_ids: Optional[List[str]] = Field(None, description="IDs of custom prompts to include in agent flow")
+    preferred_provider: Optional[str] = Field(None, description="Preferred LLM provider (e.g., 'anthropic', 'gemini_cli', 'openai')")
+    preferred_model: Optional[str] = Field(None, description="Preferred model name (e.g., 'claude-sonnet-4-20250514', 'gemini-2.0-flash')")
+    methodology_file: Optional[str] = Field(None, description="Path to external .md methodology file to inject into all AI calls")
+    enable_cli_agent: bool = Field(False, description="Enable CLI Agent (AI CLI inside Kali sandbox)")
+    cli_agent_provider: Optional[str] = Field(None, description="CLI provider: claude_code, gemini_cli, codex_cli")
+    selected_md_agents: Optional[List[str]] = Field(None, description="List of .md agent names to run (e.g. ['owasp_expert', 'red_team_agent']). None = defaults.")
 
 
 class AgentResponse(BaseModel):
@@ -152,6 +167,20 @@ async def run_agent(request: AgentRequest, background_tasks: BackgroundTasks):
     3. Generate detailed findings with CVSS, descriptions, PoC
     4. Create professional reports
     """
+    from backend.config import settings
+
+    # Enforce concurrent scan limit
+    active_count = sum(
+        1 for r in agent_results.values()
+        if r.get("status") == "running"
+    )
+    if active_count >= settings.MAX_CONCURRENT_SCANS:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Maximum concurrent scans ({settings.MAX_CONCURRENT_SCANS}) reached. "
+                   f"Stop a running scan first.",
+        )
+
     import uuid
 
     agent_id = str(uuid.uuid4())[:8]
@@ -193,7 +222,9 @@ async def run_agent(request: AgentRequest, background_tasks: BackgroundTasks):
         "findings": [],
         "report": None,
         "progress": 0,
-        "phase": "initializing"
+        "phase": "initializing",
+        "rejected_findings": [],
+        "rejected_findings_count": 0,
     }
 
     # Run agent in background
@@ -205,14 +236,25 @@ async def run_agent(request: AgentRequest, background_tasks: BackgroundTasks):
         auth_headers,
         request.max_depth,
         task,
-        request.prompt
+        request.prompt,
+        request.enable_kali_sandbox,
+        request.custom_prompt_ids,
+        request.preferred_provider,
+        request.preferred_model,
+        request.methodology_file,
+        request.enable_cli_agent,
+        request.cli_agent_provider,
+        request.selected_md_agents,
     )
 
     mode_descriptions = {
         "full_auto": "Full autonomous pentest: Recon -> Analyze -> Test -> Report",
         "recon_only": "Reconnaissance only, no vulnerability testing",
         "prompt_only": "AI decides everything (high token usage!)",
-        "analyze_only": "Analysis only, no active testing"
+        "analyze_only": "Analysis only, no active testing",
+        "auto_pentest": "One-click auto pentest: Full recon + 100 vuln types + AI report",
+        "cli_agent": "CLI Agent: AI CLI tool (Claude/Gemini/Codex) inside Kali sandbox",
+        "full_llm_pentest": "Full LLM Pentest: AI drives the entire pentest cycle autonomously",
     }
 
     return AgentResponse(
@@ -230,7 +272,15 @@ async def _run_agent_task(
     auth_headers: Dict,
     max_depth: int,
     task,
-    custom_prompt: str
+    custom_prompt: str,
+    enable_kali_sandbox: bool = False,
+    custom_prompt_ids: Optional[List[str]] = None,
+    preferred_provider: Optional[str] = None,
+    preferred_model: Optional[str] = None,
+    methodology_file: Optional[str] = None,
+    enable_cli_agent: bool = False,
+    cli_agent_provider: Optional[str] = None,
+    selected_md_agents: Optional[List[str]] = None,
 ):
     """Background task to run the agent with DATABASE PERSISTENCE and REAL-TIME FINDINGS"""
     logs = []
@@ -254,13 +304,26 @@ async def _run_agent_task(
         if agent_id in agent_results:
             agent_results[agent_id]["progress"] = progress
             agent_results[agent_id]["phase"] = phase
+            # Sync container telemetry in real-time
+            if agent_id in agent_instances:
+                _inst = agent_instances[agent_id]
+                agent_results[agent_id]["tool_executions"] = list(getattr(_inst, 'tool_executions', []))
+                agent_results[agent_id]["container_status"] = getattr(_inst, 'container_status', None)
+
+    rejected_findings_list = []
 
     async def finding_callback(finding: Dict):
         """Real-time finding callback - updates in-memory storage immediately"""
-        findings_list.append(finding)
-        if agent_id in agent_results:
-            agent_results[agent_id]["findings"] = findings_list
-            agent_results[agent_id]["findings_count"] = len(findings_list)
+        if finding.get("ai_status") == "rejected":
+            rejected_findings_list.append(finding)
+            if agent_id in agent_results:
+                agent_results[agent_id]["rejected_findings"] = rejected_findings_list
+                agent_results[agent_id]["rejected_findings_count"] = len(rejected_findings_list)
+        else:
+            findings_list.append(finding)
+            if agent_id in agent_results:
+                agent_results[agent_id]["findings"] = findings_list
+                agent_results[agent_id]["findings_count"] = len(findings_list)
 
     try:
         # Create database session and scan record
@@ -289,9 +352,29 @@ async def _run_agent_task(
             db.add(target_record)
             await db.commit()
 
-            # Store mapping
+            # Store mapping (both directions)
             agent_to_scan[agent_id] = scan_id
+            scan_to_agent[scan_id] = agent_id
             agent_results[agent_id]["scan_id"] = scan_id
+
+            # Load custom prompts from database if IDs provided
+            loaded_custom_prompts = []
+            if custom_prompt_ids:
+                try:
+                    from backend.models import Prompt
+                    for pid in custom_prompt_ids[:10]:  # Max 10 prompts
+                        result = await db.execute(select(Prompt).where(Prompt.id == pid))
+                        prompt_obj = result.scalar_one_or_none()
+                        if prompt_obj:
+                            loaded_custom_prompts.append({
+                                "id": str(prompt_obj.id),
+                                "name": prompt_obj.name,
+                                "content": prompt_obj.content,
+                                "category": prompt_obj.category,
+                                "parsed_vulnerabilities": prompt_obj.parsed_vulnerabilities or [],
+                            })
+                except Exception as e:
+                    await log_callback("warning", f"[PROMPTS] Failed to load custom prompts: {e}")
 
             # Map mode
             mode_map = {
@@ -299,8 +382,15 @@ async def _run_agent_task(
                 AgentMode.RECON_ONLY: OperationMode.RECON_ONLY,
                 AgentMode.PROMPT_ONLY: OperationMode.PROMPT_ONLY,
                 AgentMode.ANALYZE_ONLY: OperationMode.ANALYZE_ONLY,
+                AgentMode.AUTO_PENTEST: OperationMode.AUTO_PENTEST,
+                AgentMode.CLI_AGENT: OperationMode.CLI_AGENT,
+                AgentMode.FULL_LLM_PENTEST: OperationMode.FULL_LLM_PENTEST,
             }
             op_mode = mode_map.get(mode, OperationMode.FULL_AUTO)
+
+            # CLI Agent mode forces kali sandbox on
+            if mode == AgentMode.CLI_AGENT:
+                enable_kali_sandbox = True
 
             async with AutonomousAgent(
                 target=target,
@@ -311,6 +401,15 @@ async def _run_agent_task(
                 task=task,
                 custom_prompt=custom_prompt or (task.prompt if task else None),
                 finding_callback=finding_callback,
+                scan_id=str(scan_id),
+                enable_kali_sandbox=enable_kali_sandbox,
+                loaded_custom_prompts=loaded_custom_prompts,
+                preferred_provider=preferred_provider,
+                preferred_model=preferred_model,
+                methodology_file=methodology_file,
+                enable_cli_agent=enable_cli_agent,
+                cli_agent_provider=cli_agent_provider,
+                selected_md_agents=selected_md_agents,
             ) as agent:
                 # Store agent instance for stop functionality
                 agent_instances[agent_id] = agent
@@ -335,7 +434,7 @@ async def _run_agent_task(
                         cvss_score=finding.get("cvss_score"),
                         cvss_vector=finding.get("cvss_vector"),
                         cwe_id=finding.get("cwe_id"),
-                        description=finding.get("description", finding.get("evidence", "")),
+                        description=finding.get("description") or finding.get("evidence") or "",
                         affected_endpoint=finding.get("affected_endpoint", finding.get("endpoint", finding.get("url", target))),
                         poc_payload=finding.get("payload", finding.get("poc_payload", "")),
                         poc_parameter=finding.get("parameter", finding.get("poc_parameter", "")),
@@ -345,7 +444,47 @@ async def _run_agent_task(
                         impact=finding.get("impact", ""),
                         remediation=finding.get("remediation", ""),
                         references=finding.get("references", []),
-                        ai_analysis=finding.get("ai_analysis", finding.get("exploitation_steps", ""))
+                        ai_analysis=finding.get("ai_analysis", finding.get("exploitation_steps", "")),
+                        poc_code=finding.get("poc_code", ""),
+                        screenshots=finding.get("screenshots", []),
+                        url=finding.get("url", finding.get("affected_endpoint", "")),
+                        parameter=finding.get("parameter", finding.get("poc_parameter", "")),
+                        confidence_score=finding.get("confidence_score", 0),
+                        confidence_breakdown=finding.get("confidence_breakdown", {}),
+                        proof_of_execution=finding.get("proof_of_execution", ""),
+                        validation_status="ai_confirmed",
+                    )
+                    db.add(vuln)
+
+                # Save rejected findings to database for manual review
+                for finding in report.get("rejected_findings", []):
+                    vuln = Vulnerability(
+                        scan_id=scan_id,
+                        title=finding.get("title", finding.get("type", "Unknown")),
+                        vulnerability_type=finding.get("vulnerability_type", finding.get("type", "unknown")),
+                        severity=finding.get("severity", "medium").lower(),
+                        cvss_score=finding.get("cvss_score"),
+                        cvss_vector=finding.get("cvss_vector"),
+                        cwe_id=finding.get("cwe_id"),
+                        description=finding.get("description") or finding.get("evidence") or "",
+                        affected_endpoint=finding.get("affected_endpoint", finding.get("endpoint", finding.get("url", target))),
+                        poc_payload=finding.get("payload", finding.get("poc_payload", "")),
+                        poc_parameter=finding.get("parameter", finding.get("poc_parameter", "")),
+                        poc_evidence=finding.get("evidence", finding.get("poc_evidence", "")),
+                        poc_request=str(finding.get("request", finding.get("poc_request", "")))[:5000],
+                        poc_response=str(finding.get("response", finding.get("poc_response", "")))[:5000],
+                        impact=finding.get("impact", ""),
+                        remediation=finding.get("remediation", ""),
+                        references=finding.get("references", []),
+                        poc_code=finding.get("poc_code", ""),
+                        screenshots=finding.get("screenshots", []),
+                        url=finding.get("url", finding.get("affected_endpoint", "")),
+                        parameter=finding.get("parameter", finding.get("poc_parameter", "")),
+                        confidence_score=finding.get("confidence_score", 0),
+                        confidence_breakdown=finding.get("confidence_breakdown", {}),
+                        proof_of_execution=finding.get("proof_of_execution", ""),
+                        validation_status="ai_rejected",
+                        ai_rejection_reason=finding.get("rejection_reason", ""),
                     )
                     db.add(vuln)
 
@@ -402,6 +541,7 @@ async def _run_agent_task(
                 agent_results[agent_id]["report"] = report
                 agent_results[agent_id]["report_id"] = report_record.id
                 agent_results[agent_id]["findings"] = findings
+                agent_results[agent_id]["tool_executions"] = report.get("tool_executions", [])
                 agent_results[agent_id]["progress"] = 100
                 agent_results[agent_id]["phase"] = "completed"
 
@@ -427,6 +567,188 @@ async def _run_agent_task(
                         await db.commit()
             except:
                 pass
+    finally:
+        # Guarantee container cleanup regardless of outcome
+        if scan_id and enable_kali_sandbox:
+            try:
+                from core.container_pool import get_pool
+                pool = get_pool()
+                await pool.destroy(str(scan_id))
+                logger.info(f"[CONTAINER] Guaranteed cleanup for scan {scan_id}")
+            except Exception:
+                pass
+
+
+@router.get("/md-agents")
+async def list_md_agents():
+    """List all available .md-based specialist agents."""
+    try:
+        from backend.core.md_agent import MdAgentLibrary
+        library = MdAgentLibrary()
+        return {"agents": library.list_agents()}
+    except ImportError:
+        return {"agents": []}
+    except Exception as e:
+        return {"agents": [], "error": str(e)}
+
+
+@router.get("/active")
+async def list_active_agents():
+    """List all active and recently completed agent sessions."""
+    from backend.config import settings
+
+    active = []
+    cutoff = (datetime.utcnow() - __import__("datetime").timedelta(minutes=10)).isoformat()
+
+    for aid, data in agent_results.items():
+        status = data.get("status", "unknown")
+        if status in ("running", "paused"):
+            active.append({
+                "agent_id": aid,
+                "target": data.get("target", ""),
+                "status": status,
+                "progress": data.get("progress", 0),
+                "phase": data.get("phase", ""),
+                "scan_id": agent_to_scan.get(aid),
+                "started_at": data.get("started_at", ""),
+                "findings_count": len(data.get("findings", [])),
+                "mode": data.get("mode", ""),
+            })
+        elif status in ("completed", "stopped", "error"):
+            completed_at = data.get("completed_at", "")
+            if completed_at and completed_at > cutoff:
+                active.append({
+                    "agent_id": aid,
+                    "target": data.get("target", ""),
+                    "status": status,
+                    "progress": data.get("progress", 100),
+                    "phase": data.get("phase", "done"),
+                    "scan_id": agent_to_scan.get(aid),
+                    "started_at": data.get("started_at", ""),
+                    "findings_count": len(data.get("findings", [])),
+                    "mode": data.get("mode", ""),
+                })
+
+    return {
+        "agents": active,
+        "max_concurrent": settings.MAX_CONCURRENT_SCANS,
+        "running_count": sum(1 for a in active if a["status"] == "running"),
+    }
+
+
+@router.get("/history")
+async def get_agent_history(
+    page: int = 1,
+    per_page: int = 20,
+    target_filter: str = "",
+):
+    """Get history of all past pentest scans from database."""
+    from sqlalchemy import select, func, desc
+    from backend.db.database import async_session_factory
+
+    async with async_session_factory() as db:
+        # Base query
+        query = select(Scan).where(Scan.status.in_(["completed", "stopped", "error"]))
+        count_query = select(func.count()).select_from(Scan).where(
+            Scan.status.in_(["completed", "stopped", "error"])
+        )
+
+        if target_filter:
+            query = query.where(Scan.name.ilike(f"%{target_filter}%"))
+            count_query = count_query.where(Scan.name.ilike(f"%{target_filter}%"))
+
+        # Total count
+        total_result = await db.execute(count_query)
+        total = total_result.scalar() or 0
+
+        # Paginated results
+        query = query.order_by(desc(Scan.created_at)).offset((page - 1) * per_page).limit(per_page)
+        result = await db.execute(query)
+        scans = result.scalars().all()
+
+        history = []
+        for s in scans:
+            # Get vulnerability count
+            vuln_result = await db.execute(
+                select(func.count()).select_from(Vulnerability).where(
+                    Vulnerability.scan_id == s.id
+                )
+            )
+            vuln_count = vuln_result.scalar() or 0
+
+            # Get endpoint count
+            ep_result = await db.execute(
+                select(func.count()).select_from(Endpoint).where(
+                    Endpoint.scan_id == s.id
+                )
+            )
+            ep_count = ep_result.scalar() or 0
+
+            # Duration
+            duration = None
+            if s.started_at and s.completed_at:
+                duration = int((s.completed_at - s.started_at).total_seconds())
+
+            # Extract clean URL from scan name (format: "AI Agent: mode - url")
+            clean_target = s.name
+            if " - " in clean_target:
+                clean_target = clean_target.split(" - ", 1)[-1]
+            if clean_target.startswith("AI Agent:"):
+                clean_target = clean_target.replace("AI Agent:", "").strip()
+
+            history.append({
+                "scan_id": s.id,
+                "target": clean_target,
+                "status": s.status,
+                "mode": getattr(s, "scan_type", "full_auto") or "full_auto",
+                "findings_count": vuln_count,
+                "endpoints_count": ep_count,
+                "critical_count": s.critical_count or 0,
+                "high_count": s.high_count or 0,
+                "medium_count": s.medium_count or 0,
+                "low_count": s.low_count or 0,
+                "duration_seconds": duration,
+                "created_at": s.created_at.isoformat() if s.created_at else None,
+                "completed_at": s.completed_at.isoformat() if s.completed_at else None,
+            })
+
+        return {
+            "history": history,
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+        }
+
+
+@router.get("/by-scan/{scan_id}")
+async def get_agent_by_scan(scan_id: str):
+    """Look up agent status by scan_id (reverse lookup for ScanDetailsPage)"""
+    agent_id = scan_to_agent.get(scan_id)
+    if not agent_id:
+        raise HTTPException(status_code=404, detail="No agent found for this scan")
+
+    if agent_id in agent_results:
+        result = agent_results[agent_id]
+        return {
+            "agent_id": agent_id,
+            "scan_id": scan_id,
+            "status": result["status"],
+            "mode": result.get("mode", "full_auto"),
+            "target": result["target"],
+            "progress": result.get("progress", 0),
+            "phase": result.get("phase", "unknown"),
+            "started_at": result.get("started_at"),
+            "completed_at": result.get("completed_at"),
+            "findings_count": len(result.get("findings", [])),
+            "findings": result.get("findings", []),
+            "rejected_findings_count": len(result.get("rejected_findings", [])),
+            "rejected_findings": result.get("rejected_findings", []),
+            "logs_count": len(result.get("logs", [])),
+            "report": result.get("report"),
+            "error": result.get("error")
+        }
+
+    raise HTTPException(status_code=404, detail="Agent data no longer in memory")
 
 
 @router.get("/status/{agent_id}")
@@ -449,8 +771,12 @@ async def get_agent_status(agent_id: str):
             "logs_count": len(result.get("logs", [])),
             "findings_count": len(result.get("findings", [])),
             "findings": result.get("findings", []),
+            "rejected_findings_count": len(result.get("rejected_findings", [])),
+            "rejected_findings": result.get("rejected_findings", []),
             "report": result.get("report"),
-            "error": result.get("error")
+            "error": result.get("error"),
+            "tool_executions": result.get("tool_executions", []),
+            "container_status": result.get("container_status"),
         }
 
     # Fall back to database if scan_id is stored
@@ -495,10 +821,12 @@ async def _get_status_from_db(agent_id: str, scan_id: str):
                 "evidence": getattr(v, 'poc_evidence', None) or "",
                 "request": v.poc_request or "",
                 "response": v.poc_response or "",
-                "poc_code": v.poc_payload or "",
+                "poc_code": getattr(v, 'poc_code', None) or v.poc_payload or "",
                 "impact": v.impact or "",
                 "remediation": v.remediation or "",
                 "references": v.references or [],
+                "screenshots": getattr(v, 'screenshots', None) or [],
+                "url": getattr(v, 'url', None) or v.affected_endpoint or "",
                 "ai_verified": True,
                 "confidence": "high"
             }
@@ -542,14 +870,14 @@ async def _get_status_from_db(agent_id: str, scan_id: str):
 
 @router.post("/stop/{agent_id}")
 async def stop_agent(agent_id: str):
-    """Stop a running agent scan and auto-generate report"""
+    """Stop a running agent scan, save all findings to DB, and generate report."""
     if agent_id not in agent_results:
         raise HTTPException(status_code=404, detail="Agent not found")
 
     if agent_results[agent_id]["status"] != "running":
         return {"message": "Agent is not running", "status": agent_results[agent_id]["status"]}
 
-    # Cancel the agent
+    # Cancel the agent immediately
     if agent_id in agent_instances:
         agent_instances[agent_id].cancel()
 
@@ -558,9 +886,10 @@ async def stop_agent(agent_id: str):
     agent_results[agent_id]["phase"] = "stopped"
     agent_results[agent_id]["completed_at"] = datetime.utcnow().isoformat()
 
-    # Update database and auto-generate report
+    # Update database: save findings + generate report
     scan_id = agent_to_scan.get(agent_id)
     report_id = None
+    target = agent_results[agent_id].get("target", "Unknown")
 
     if scan_id:
         try:
@@ -573,47 +902,500 @@ async def stop_agent(agent_id: str):
                     scan.status = "stopped"
                     scan.completed_at = datetime.utcnow()
 
-                    # Get findings count
+                    # Save confirmed findings to DB (same as completion flow)
                     findings = agent_results[agent_id].get("findings", [])
-                    scan.total_vulnerabilities = len(findings)
+                    severity_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
 
-                    # Count severities
                     for finding in findings:
-                        severity = finding.get("severity", "").lower()
-                        if severity == "critical":
-                            scan.critical_count = (scan.critical_count or 0) + 1
-                        elif severity == "high":
-                            scan.high_count = (scan.high_count or 0) + 1
-                        elif severity == "medium":
-                            scan.medium_count = (scan.medium_count or 0) + 1
-                        elif severity == "low":
-                            scan.low_count = (scan.low_count or 0) + 1
-                        elif severity == "info":
-                            scan.info_count = (scan.info_count or 0) + 1
+                        severity = finding.get("severity", "medium").lower()
+                        if severity in severity_counts:
+                            severity_counts[severity] += 1
+
+                        vuln = Vulnerability(
+                            scan_id=scan_id,
+                            title=finding.get("title", finding.get("type", "Unknown")),
+                            vulnerability_type=finding.get("vulnerability_type", finding.get("type", "unknown")),
+                            severity=severity,
+                            cvss_score=finding.get("cvss_score"),
+                            cvss_vector=finding.get("cvss_vector"),
+                            cwe_id=finding.get("cwe_id"),
+                            description=finding.get("description") or finding.get("evidence") or "",
+                            affected_endpoint=finding.get("affected_endpoint", finding.get("endpoint", finding.get("url", target))),
+                            poc_payload=finding.get("payload", finding.get("poc_payload", "")),
+                            poc_parameter=finding.get("parameter", finding.get("poc_parameter", "")),
+                            poc_evidence=finding.get("evidence", finding.get("poc_evidence", "")),
+                            poc_request=str(finding.get("request", finding.get("poc_request", "")))[:5000],
+                            poc_response=str(finding.get("response", finding.get("poc_response", "")))[:5000],
+                            impact=finding.get("impact", ""),
+                            remediation=finding.get("remediation", ""),
+                            references=finding.get("references", []),
+                            ai_analysis=finding.get("ai_analysis", finding.get("exploitation_steps", "")),
+                            poc_code=finding.get("poc_code", ""),
+                            screenshots=finding.get("screenshots", []),
+                            url=finding.get("url", finding.get("affected_endpoint", "")),
+                            parameter=finding.get("parameter", finding.get("poc_parameter", "")),
+                            confidence_score=finding.get("confidence_score", 0),
+                            confidence_breakdown=finding.get("confidence_breakdown", {}),
+                            proof_of_execution=finding.get("proof_of_execution", ""),
+                            validation_status="ai_confirmed",
+                        )
+                        db.add(vuln)
+
+                    # Save rejected findings to DB for manual review
+                    rejected = agent_results[agent_id].get("rejected_findings", [])
+                    for finding in rejected:
+                        vuln = Vulnerability(
+                            scan_id=scan_id,
+                            title=finding.get("title", finding.get("type", "Unknown")),
+                            vulnerability_type=finding.get("vulnerability_type", finding.get("type", "unknown")),
+                            severity=finding.get("severity", "medium").lower(),
+                            cvss_score=finding.get("cvss_score"),
+                            cvss_vector=finding.get("cvss_vector"),
+                            cwe_id=finding.get("cwe_id"),
+                            description=finding.get("description") or finding.get("evidence") or "",
+                            affected_endpoint=finding.get("affected_endpoint", finding.get("endpoint", finding.get("url", target))),
+                            poc_payload=finding.get("payload", finding.get("poc_payload", "")),
+                            poc_parameter=finding.get("parameter", finding.get("poc_parameter", "")),
+                            poc_evidence=finding.get("evidence", finding.get("poc_evidence", "")),
+                            poc_request=str(finding.get("request", finding.get("poc_request", "")))[:5000],
+                            poc_response=str(finding.get("response", finding.get("poc_response", "")))[:5000],
+                            impact=finding.get("impact", ""),
+                            remediation=finding.get("remediation", ""),
+                            references=finding.get("references", []),
+                            poc_code=finding.get("poc_code", ""),
+                            screenshots=finding.get("screenshots", []),
+                            url=finding.get("url", finding.get("affected_endpoint", "")),
+                            parameter=finding.get("parameter", finding.get("poc_parameter", "")),
+                            confidence_score=finding.get("confidence_score", 0),
+                            confidence_breakdown=finding.get("confidence_breakdown", {}),
+                            proof_of_execution=finding.get("proof_of_execution", ""),
+                            validation_status="ai_rejected",
+                            ai_rejection_reason=finding.get("rejection_reason", ""),
+                        )
+                        db.add(vuln)
+
+                    # Update scan counts (confirmed only)
+                    scan.total_vulnerabilities = len(findings)
+                    scan.critical_count = severity_counts["critical"]
+                    scan.high_count = severity_counts["high"]
+                    scan.medium_count = severity_counts["medium"]
+                    scan.low_count = severity_counts["low"]
+                    scan.info_count = severity_counts["info"]
 
                     await db.commit()
 
-                    # Auto-generate report
-                    report = Report(
+                    # Auto-generate report record
+                    report_record = Report(
                         scan_id=scan_id,
-                        title=f"Agent Scan Report - {agent_results[agent_id].get('target', 'Unknown')}",
+                        title=f"Agent Scan Report - {target}",
                         format="json",
-                        executive_summary=f"Automated security scan completed with {len(findings)} findings."
+                        executive_summary=f"Security scan stopped with {len(findings)} confirmed and {len(rejected)} rejected findings."
                     )
-                    db.add(report)
+                    db.add(report_record)
                     await db.commit()
-                    await db.refresh(report)
-                    report_id = report.id
+                    await db.refresh(report_record)
+                    report_id = report_record.id
 
         except Exception as e:
-            print(f"Error updating scan status: {e}")
+            print(f"Error updating scan status on stop: {e}")
             import traceback
             traceback.print_exc()
 
     return {
         "message": "Agent stopped successfully",
         "agent_id": agent_id,
-        "report_id": report_id
+        "report_id": report_id,
+        "findings_saved": len(agent_results[agent_id].get("findings", [])),
+        "rejected_saved": len(agent_results[agent_id].get("rejected_findings", [])),
+    }
+
+
+@router.post("/pause/{agent_id}")
+async def pause_agent(agent_id: str):
+    """Pause a running agent scan"""
+    if agent_id not in agent_results:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    if agent_results[agent_id]["status"] != "running":
+        return {"message": "Agent is not running", "status": agent_results[agent_id]["status"]}
+
+    if agent_id in agent_instances:
+        agent_instances[agent_id].pause()
+
+    # Save current phase before overwriting with "paused"
+    agent_results[agent_id]["last_phase"] = agent_results[agent_id].get("phase", "recon")
+    agent_results[agent_id]["status"] = "paused"
+    agent_results[agent_id]["phase"] = "paused"
+
+    return {"message": "Agent paused", "agent_id": agent_id}
+
+
+@router.post("/resume/{agent_id}")
+async def resume_agent(agent_id: str):
+    """Resume a paused agent scan"""
+    if agent_id not in agent_results:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    if agent_results[agent_id]["status"] != "paused":
+        return {"message": "Agent is not paused", "status": agent_results[agent_id]["status"]}
+
+    if agent_id in agent_instances:
+        agent_instances[agent_id].resume()
+
+    agent_results[agent_id]["status"] = "running"
+    # Restore the phase that was active before pause
+    agent_results[agent_id]["phase"] = agent_results[agent_id].get("last_phase", "testing")
+
+    return {"message": "Agent resumed", "agent_id": agent_id}
+
+
+class TripleCheckRequest(BaseModel):
+    """Request to triple-check findings with a different model"""
+    preferred_provider: Optional[str] = None
+    preferred_model: Optional[str] = None
+
+
+@router.post("/triple-check/{scan_id}")
+async def triple_check_scan(scan_id: str, request: TripleCheckRequest, background_tasks: BackgroundTasks):
+    """Re-validate findings from a completed scan using a different LLM model.
+
+    Does NOT re-run the full pentest. Only re-tests the specific vulnerabilities
+    that were found, using a different AI model for validation.
+    """
+    from sqlalchemy import select
+    from backend.db.database import async_session_factory
+    import uuid
+
+    # Load existing findings from DB
+    async with async_session_factory() as db:
+        scan_result = await db.execute(select(Scan).where(Scan.id == scan_id))
+        scan = scan_result.scalar_one_or_none()
+        if not scan:
+            raise HTTPException(404, "Scan not found")
+        if scan.status not in ("completed", "stopped"):
+            raise HTTPException(400, f"Scan status is '{scan.status}', must be completed/stopped")
+
+        vuln_result = await db.execute(
+            select(Vulnerability).where(Vulnerability.scan_id == scan_id)
+        )
+        vulns = vuln_result.scalars().all()
+        if not vulns:
+            raise HTTPException(400, "No findings to triple-check")
+
+        target = scan.name
+
+    agent_id = str(uuid.uuid4())[:8]
+
+    # Build findings list for re-validation
+    findings_to_check = []
+    for v in vulns:
+        findings_to_check.append({
+            "title": v.title,
+            "severity": v.severity,
+            "vulnerability_type": v.vulnerability_type,
+            "affected_endpoint": v.affected_endpoint or v.url or "",
+            "parameter": v.parameter or "",
+            "payload": v.poc_payload or "",
+            "evidence": v.evidence or "",
+            "poc_code": getattr(v, "poc_code", "") or "",
+            "request": v.poc_request or "",
+            "response": v.poc_response or "",
+            "original_confidence": getattr(v, "confidence_score", 0) or 0,
+            "validation_status": getattr(v, "validation_status", "ai_confirmed"),
+        })
+
+    # Store in agent_results
+    agent_results[agent_id] = {
+        "status": "running",
+        "target": target,
+        "mode": "triple_check",
+        "scan_id": scan_id,
+        "progress": 0,
+        "phase": "triple-check",
+        "started_at": datetime.utcnow().isoformat(),
+        "findings": [],
+        "rejected_findings": [],
+        "logs": [],
+        "original_scan_id": scan_id,
+    }
+    agent_to_scan[agent_id] = scan_id
+
+    background_tasks.add_task(
+        _run_triple_check,
+        agent_id, target, scan_id, findings_to_check,
+        request.preferred_provider, request.preferred_model,
+    )
+
+    return AgentResponse(
+        agent_id=agent_id,
+        status="running",
+        mode="triple_check",
+        message=f"Triple-check started for {len(findings_to_check)} findings with different model",
+    )
+
+
+async def _run_triple_check(
+    agent_id: str, target: str, scan_id: str,
+    findings: list, preferred_provider: str, preferred_model: str,
+):
+    """Re-validate each finding by re-sending the payload and using AI with a different model."""
+    import aiohttp
+    import ssl
+
+    try:
+        ssl_ctx = ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+        connector = aiohttp.TCPConnector(ssl=ssl_ctx, limit=10)
+
+        from backend.core.autonomous_agent import LLMClient
+        from backend.core.vuln_engine.system_prompts import get_prompt_for_vuln_type
+
+        print(f"[Triple-Check] Starting for scan {scan_id} with {len(findings)} findings, "
+              f"model={preferred_provider or 'auto'}/{preferred_model or 'auto'}")
+
+        llm = LLMClient(
+            preferred_provider=preferred_provider,
+            preferred_model=preferred_model,
+        )
+
+        if not llm.is_available():
+            msg = "LLM not available. Check your API keys or SmartRouter configuration."
+            print(f"[Triple-Check] ERROR: {msg}")
+            agent_results[agent_id]["logs"].append({
+                "timestamp": datetime.utcnow().isoformat(),
+                "level": "error",
+                "message": msg,
+            })
+            agent_results[agent_id]["status"] = "error"
+            agent_results[agent_id]["error"] = msg
+            return
+
+        confirmed = []
+        rejected = []
+
+        async with aiohttp.ClientSession(connector=connector) as session:
+            total = len(findings)
+            for i, f in enumerate(findings):
+                agent_results[agent_id]["progress"] = int((i / total) * 100)
+                agent_results[agent_id]["phase"] = f"triple-check ({i+1}/{total})"
+
+                endpoint = f["affected_endpoint"]
+                payload = f["payload"]
+                vuln_type = f["vulnerability_type"]
+                method = "GET"
+                if f.get("request"):
+                    parts = f["request"].split()
+                    if parts:
+                        method = parts[0].upper()
+
+                # Re-send the payload
+                re_validated = False
+                response_text = ""
+                response_status = 0
+                try:
+                    if method == "POST":
+                        param = f.get("parameter", "test")
+                        async with session.post(
+                            endpoint, data={param: payload}, timeout=aiohttp.ClientTimeout(total=15)
+                        ) as resp:
+                            response_status = resp.status
+                            response_text = await resp.text(errors="replace")
+                    else:
+                        sep = "&" if "?" in endpoint else "?"
+                        param = f.get("parameter", "test")
+                        test_url = f"{endpoint}{sep}{param}={payload}" if param else endpoint
+                        async with session.get(
+                            test_url, timeout=aiohttp.ClientTimeout(total=15)
+                        ) as resp:
+                            response_status = resp.status
+                            response_text = await resp.text(errors="replace")
+                except Exception as e:
+                    response_text = f"Error: {e}"
+
+                # AI re-validation with different model
+                if llm.is_available() and response_text:
+                    try:
+                        system = get_prompt_for_vuln_type(vuln_type, "confirmation")
+                        prompt = (
+                            f"TRIPLE-CHECK VALIDATION: Re-analyzing a previously found vulnerability.\n\n"
+                            f"Vulnerability: {f['title']}\n"
+                            f"Type: {vuln_type}\n"
+                            f"Endpoint: {endpoint}\n"
+                            f"Parameter: {f.get('parameter', 'N/A')}\n"
+                            f"Payload: {payload}\n"
+                            f"Original evidence: {f.get('evidence', 'N/A')[:500]}\n\n"
+                            f"Re-test response (status {response_status}):\n"
+                            f"{response_text[:3000]}\n\n"
+                            f"Is this vulnerability CONFIRMED by the re-test response? "
+                            f"Reply with JSON: {{\"confirmed\": true/false, \"confidence\": 0-100, \"reason\": \"...\"}}"
+                        )
+                        ai_result = await llm.generate(prompt, system)
+                        if ai_result:
+                            import json
+                            try:
+                                # Extract JSON from response
+                                json_str = ai_result
+                                if "```" in json_str:
+                                    json_str = json_str.split("```")[1].strip()
+                                    if json_str.startswith("json"):
+                                        json_str = json_str[4:].strip()
+                                parsed = json.loads(json_str)
+                                re_validated = parsed.get("confirmed", False)
+                                f["triple_check_confidence"] = parsed.get("confidence", 0)
+                                f["triple_check_reason"] = parsed.get("reason", "")
+                                f["triple_check_model"] = f"{preferred_provider or 'auto'}/{preferred_model or 'auto'}"
+                            except (json.JSONDecodeError, IndexError):
+                                # If AI says "confirmed" anywhere, treat as confirmed
+                                re_validated = "confirmed" in ai_result.lower() and "not confirmed" not in ai_result.lower()
+                                f["triple_check_reason"] = ai_result[:200]
+                    except Exception:
+                        pass
+
+                f["triple_check_status"] = "confirmed" if re_validated else "rejected"
+                f["triple_check_response_status"] = response_status
+
+                if re_validated:
+                    confirmed.append(f)
+                else:
+                    rejected.append(f)
+
+                log_entry = {
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "level": "warning" if re_validated else "info",
+                    "message": f"[{'CONFIRMED' if re_validated else 'REJECTED'}] {f['title']} "
+                               f"(confidence: {f.get('triple_check_confidence', '?')})"
+                }
+                agent_results[agent_id]["logs"].append(log_entry)
+
+        # Update results
+        agent_results[agent_id]["status"] = "completed"
+        agent_results[agent_id]["progress"] = 100
+        agent_results[agent_id]["phase"] = "completed"
+        agent_results[agent_id]["completed_at"] = datetime.utcnow().isoformat()
+        agent_results[agent_id]["findings"] = confirmed
+        agent_results[agent_id]["rejected_findings"] = rejected
+        agent_results[agent_id]["report"] = {
+            "type": "triple_check",
+            "original_scan_id": scan_id,
+            "target": target,
+            "model_used": f"{preferred_provider or 'auto'}/{preferred_model or 'auto'}",
+            "total_checked": len(findings),
+            "confirmed": len(confirmed),
+            "rejected": len(rejected),
+            "findings": confirmed,
+            "rejected_findings": rejected,
+        }
+
+        # Update DB: upgrade or downgrade validation_status based on triple-check
+        try:
+            async with async_session_factory() as db:
+                from sqlalchemy import select, update
+                for f in rejected:
+                    await db.execute(
+                        update(Vulnerability).where(
+                            Vulnerability.scan_id == scan_id,
+                            Vulnerability.title == f["title"],
+                        ).values(
+                            validation_status="triple_check_rejected",
+                            ai_rejection_reason=f.get("triple_check_reason", "Rejected by triple-check")[:500],
+                        )
+                    )
+                for f in confirmed:
+                    await db.execute(
+                        update(Vulnerability).where(
+                            Vulnerability.scan_id == scan_id,
+                            Vulnerability.title == f["title"],
+                        ).values(
+                            validation_status="triple_check_confirmed",
+                        )
+                    )
+                await db.commit()
+        except Exception as e:
+            print(f"Triple-check DB update error: {e}")
+
+    except Exception as e:
+        import traceback
+        print(f"Triple-check error: {traceback.format_exc()}")
+        agent_results[agent_id]["status"] = "error"
+        agent_results[agent_id]["error"] = str(e)
+
+
+# Agent phase order for skip validation
+AGENT_PHASE_ORDER = ["recon", "analysis", "testing", "enhancement", "completed"]
+
+# Map phase names from status strings to canonical phase keys
+PHASE_NORMALIZE = {
+    "starting reconnaissance": "recon",
+    "reconnaissance complete": "recon",
+    "initial probe complete": "recon",
+    "endpoint discovery complete": "recon",
+    "parameter discovery complete": "recon",
+    "attack surface analyzed": "analysis",
+    "vulnerability testing complete": "testing",
+    "findings enhanced": "enhancement",
+    "assessment complete": "completed",
+}
+
+
+@router.post("/skip-to/{agent_id}/{target_phase}")
+async def skip_agent_phase(agent_id: str, target_phase: str):
+    """Skip the current agent phase and jump to a target phase.
+
+    Valid phases: recon, analysis, testing, enhancement, completed
+    Can only skip forward (to a phase ahead of current).
+    """
+    if agent_id not in agent_results:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    agent_status = agent_results[agent_id]["status"]
+    if agent_status not in ("running", "paused"):
+        raise HTTPException(status_code=400, detail="Agent is not running or paused")
+
+    if target_phase not in AGENT_PHASE_ORDER:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid phase '{target_phase}'. Valid: {', '.join(AGENT_PHASE_ORDER[1:])}"
+        )
+
+    # Get current phase and normalize it
+    current_raw = agent_results[agent_id].get("phase", "").lower()
+    # Handle "paused" phase — use the last known non-paused phase, default to recon
+    if current_raw in ("paused", "stopped"):
+        current_raw = agent_results[agent_id].get("last_phase", "recon")
+    current_phase = PHASE_NORMALIZE.get(current_raw, current_raw)
+    # Also try prefix match
+    for key in AGENT_PHASE_ORDER:
+        if key in current_phase:
+            current_phase = key
+            break
+
+    cur_idx = AGENT_PHASE_ORDER.index(current_phase) if current_phase in AGENT_PHASE_ORDER else 0
+    tgt_idx = AGENT_PHASE_ORDER.index(target_phase)
+
+    if tgt_idx <= cur_idx:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot skip backward. Current: {current_phase}, target: {target_phase}"
+        )
+
+    # Signal the agent instance to skip
+    if agent_id in agent_instances:
+        # If paused, resume first so the skip can be processed
+        if agent_status == "paused":
+            agent_instances[agent_id].resume()
+            agent_results[agent_id]["status"] = "running"
+        success = agent_instances[agent_id].skip_to_phase(target_phase)
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to signal phase skip")
+    else:
+        raise HTTPException(status_code=400, detail="Agent instance not available for signaling")
+
+    return {
+        "message": f"Skipping to phase: {target_phase}",
+        "agent_id": agent_id,
+        "from_phase": current_phase,
+        "target_phase": target_phase
     }
 
 
@@ -1094,17 +1876,26 @@ async def send_realtime_message(session_id: str, request: RealtimeMessageRequest
             if not llm_status.get("lmstudio_available"):
                 error_details.append("LM Studio not running")
             if not llm_status.get("has_google_key"):
-                error_details.append("No GOOGLE_API_KEY set")
+                error_details.append("No GEMINI_API_KEY set")
+            if not llm_status.get("has_openrouter_key"):
+                error_details.append("No OPENROUTER_API_KEY set")
+            if not llm_status.get("has_together_key"):
+                error_details.append("No TOGETHER_API_KEY set")
+            if not llm_status.get("has_fireworks_key"):
+                error_details.append("No FIREWORKS_API_KEY set")
 
             error_msg = f"""⚠️ **No LLM Provider Available**
 
-Configure at least one of the following:
+Configure at least one of the following in your `.env` file:
 
-1. **Claude (Anthropic)**: Set `ANTHROPIC_API_KEY` environment variable
-2. **OpenAI/ChatGPT**: Set `OPENAI_API_KEY` environment variable
-3. **Google Gemini**: Set `GOOGLE_API_KEY` environment variable
-4. **Ollama (Local)**: Run `ollama serve` and ensure a model is pulled
-5. **LM Studio (Local)**: Start LM Studio server on port 1234
+1. **Claude (Anthropic)**: Set `ANTHROPIC_API_KEY`
+2. **OpenAI/ChatGPT**: Set `OPENAI_API_KEY`
+3. **OpenRouter (multi-model)**: Set `OPENROUTER_API_KEY`
+4. **Google Gemini**: Set `GEMINI_API_KEY`
+5. **Together AI**: Set `TOGETHER_API_KEY`
+6. **Fireworks AI**: Set `FIREWORKS_API_KEY`
+7. **Ollama (Local)**: Run `ollama serve` and ensure a model is pulled
+8. **LM Studio (Local)**: Start LM Studio server on port 1234
 
 **Current status:**
 {chr(10).join(f"- {d}" for d in error_details) if error_details else "- Unknown configuration issue"}
@@ -1705,13 +2496,16 @@ async def _save_realtime_findings_to_db(session_id: str, session: Dict):
                     cvss_score=finding.get("cvss_score"),
                     cvss_vector=finding.get("cvss_vector"),
                     cwe_id=finding.get("cwe_id"),
-                    description=finding.get("description", ""),
+                    description=finding.get("description") or finding.get("evidence") or "",
                     affected_endpoint=finding.get("affected_endpoint", target),
                     poc_payload=finding.get("evidence", finding.get("payload", "")),
                     impact=finding.get("impact", ""),
                     remediation=finding.get("remediation", ""),
                     references=finding.get("references", []),
-                    ai_analysis=f"Identified during realtime session {session_id}"
+                    ai_analysis=f"Identified during realtime session {session_id}",
+                    screenshots=finding.get("screenshots", []),
+                    url=finding.get("url", finding.get("affected_endpoint", "")),
+                    parameter=finding.get("parameter", "")
                 )
                 db.add(vuln)
 
@@ -1808,6 +2602,29 @@ async def generate_realtime_report(session_id: str, format: str = "json"):
             findings=findings,
             scan_results=tool_results
         )
+
+        # Save to a per-report folder with screenshots
+        import shutil
+        from pathlib import Path
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        target_name = session["target"].replace("://", "_").replace("/", "_").rstrip("_")[:40]
+        report_dir = Path("reports") / f"report_{target_name}_{timestamp}"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        (report_dir / f"report_{timestamp}.html").write_text(html_content)
+
+        # Copy screenshots into report folder
+        screenshots_src = Path("reports") / "screenshots"
+        if screenshots_src.exists():
+            screenshots_dest = report_dir / "screenshots"
+            for finding in findings:
+                fid = finding.get("id", "")
+                if fid:
+                    src_dir = screenshots_src / str(fid)
+                    if src_dir.exists():
+                        dest_dir = screenshots_dest / str(fid)
+                        dest_dir.mkdir(parents=True, exist_ok=True)
+                        for ss_file in src_dir.glob("*.png"):
+                            shutil.copy2(ss_file, dest_dir / ss_file.name)
 
         return HTMLResponse(content=html_content, media_type="text/html")
 
@@ -2302,3 +3119,39 @@ def parse_llm_findings(llm_response: str, target: str) -> List[Dict]:
             })
 
     return findings
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Per-Vulnerability-Type Agent Orchestration Dashboard
+# ──────────────────────────────────────────────────────────────────────
+
+@router.get("/checkpoints")
+async def list_checkpoints():
+    """List available scan checkpoints for resume."""
+    try:
+        from backend.core.checkpoint_manager import CheckpointManager
+        return {"checkpoints": CheckpointManager.list_checkpoints()}
+    except ImportError:
+        return {"checkpoints": []}
+
+
+@router.get("/vuln-agents/{agent_id}")
+async def get_vuln_agent_statuses(agent_id: str):
+    """Get per-vulnerability-type agent statuses for the dashboard grid.
+
+    Returns agent statuses for each of the 100 vuln types when
+    ENABLE_VULN_AGENTS is enabled.
+    """
+    if agent_id not in agent_instances:
+        raise HTTPException(404, "Agent not found")
+
+    agent = agent_instances[agent_id]
+    if not hasattr(agent, '_vuln_orchestrator') or not agent._vuln_orchestrator:
+        return {"enabled": False, "agents": [], "stats": {}}
+
+    orch = agent._vuln_orchestrator
+    return {
+        "enabled": True,
+        "agents": orch.get_all_agent_statuses(),
+        "stats": orch.get_stats(),
+    }
